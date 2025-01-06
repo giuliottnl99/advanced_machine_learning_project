@@ -11,6 +11,9 @@ from torchvision import datasets
 from torch.utils.data import random_split
 import numpy as np
 import matplotlib.pyplot as plt
+import csv
+import torch_optimizer as optim
+
 
 class LeNet5V2(nn.Module):
     def __init__(self, args, num_classes=100):
@@ -221,6 +224,11 @@ def train(args):
     epoch_training_losses = []
     train_losses = []
     test_losses = []
+    if args.start_epoch==0: #create the file if we are starting a new model
+        with open('accuraciesAndLosses.csv', mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['epoch', 'train-accuracy', 'test-accuracy', 'train_loss', 'test-loss'])  # Write headers
+
 
     # Training loop
     for epoch in range(args.start_epoch, args.epochs):
@@ -264,13 +272,13 @@ def train(args):
             is_avg_epoch = True
             torch.save(model.state_dict(), args.last_model)
 
-        epoch_loss = np.mean(local_losses)
-        if best_loss > epoch_loss:
-            best_loss = epoch_loss
+        epoch_train_loss = np.mean(local_losses)
+        if best_loss > epoch_train_loss:
+            best_loss = epoch_train_loss
             torch.save(model.state_dict(), args.best_model)
             print(f"Best model saved with loss = {best_loss}")
 
-        print(f"Epoch {epoch+1}: Loss = {epoch_loss}")
+        print(f"Epoch {epoch+1}: Loss = {epoch_train_loss}")
 
         # Evaluate on test set periodically
         if (epoch + 1) % args.eval_interval == 0:
@@ -280,9 +288,14 @@ def train(args):
             epochs.append(epoch+1)
             trainAccuracies.append(train_acc)
             testAccuracies.append(test_acc)
-            epoch_training_losses.append(epoch_loss)
-            train_losses.append(epoch_loss) #TODO: verify if this this works. Before it was just loss.item(). But avg may be more stable
-            test_losses.append(compute_test_loss(model, test_loader, criterion, device))
+            epoch_training_losses.append(epoch_train_loss)
+            train_losses.append(epoch_train_loss) #TODO: verify if this this works. Before it was just loss.item(). But avg may be more stable
+            test_loss = compute_test_loss(model, test_loader, criterion, device)
+            test_losses.append(test_loss)
+            with open('accuraciesAndLosses.csv', mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([epoch+1, train_acc, test_acc, epoch_train_loss, test_loss])  # Write headers
+
 
 
     plotEpochs(epochs, trainAccuracies, testAccuracies, 'Train accuracy', 'Test accuracy', 'accuracy_fig.png')
