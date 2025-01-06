@@ -10,6 +10,7 @@ from torchvision.transforms import Compose, ToTensor, Normalize, RandomHorizonta
 from torchvision import datasets
 from torch.utils.data import random_split
 import numpy as np
+import matplotlib.pyplot as plt
 
 class LeNet5V2(nn.Module):
     def __init__(self, args, num_classes=100):
@@ -83,14 +84,6 @@ class LeNet5(nn.Module):
         return x
 
 
-#TODO: deletable
-# def setup_distributed():
-#     if not dist.is_initialized():
-#         os.environ['RANK'] = '0'
-#         os.environ['WORLD_SIZE'] = '1'
-#         os.environ['MASTER_ADDR'] = '127.0.0.1'
-#         os.environ['MASTER_PORT'] = '29500'
-#         dist.init_process_group(backend='nccl', init_method='env://')
 
 def load_data(batch_size, hardTransform):
     if hardTransform:
@@ -140,10 +133,54 @@ def evaluate(model, data_loader, device):
             correct += predicted.eq(targets).sum().item()
     return 100 * correct / total
 
+#TODO: manage the plot!
+def plotEpochs(epochs, data_arr_1, data_arr_2, label1, label2, figName): 
+    #inputArray format: {epoch: 'number', var1: 'trainAcc', var2: 'testAcc'}
+    #labelsFormat: {lab1: 'label', lab2: 'label'}
+    plt.figure()
+    plt.plot(epochs, data_arr_1, label=label1)
+    plt.plot(epochs, data_arr_2, label=label2)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Loss Over Epochs')
+    plt.legend()
+    plt.savefig(figName)
+
+def compute_test_loss(model, test_loader, criterion, device):
+    model.eval()  # Set model to evaluation mode
+    test_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():  # Disable gradient computation
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)  # Move data to the device
+
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            # Accumulate loss
+            test_loss += loss.item() * inputs.size(0)  # Multiply by batch size
+            total_samples += inputs.size(0)
+    average_loss = test_loss / total_samples
+    return average_loss
+
+
+#TODO next
+# def computeLoss(train_loaders_splitted, device, local_optimizer, local_model, criterion):
+#     for inputs, targets in train_loaders_splitted[i]:
+#         inputs, targets = inputs.to(device), targets.to(device)
+#         local_optimizer.zero_grad()
+#         outputs = local_model(inputs)
+#         loss = criterion(outputs, targets)
+#         loss.backward()
+#         local_optimizer.step()
+
+
+
 def train(args):
     # Setup device and distributed training
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # setup_distributed() #DELETABLE!
 
     # Load data
     train_dataset, test_dataset, train_loader, test_loader = load_data(args.batch_size, args.transform)
@@ -178,6 +215,13 @@ def train(args):
 
     print(f"Training with {args.K} splits and averaging every {args.J} epochs")
 
+    epochs = []
+    trainAccuracies = []
+    testAccuracies = []
+    epoch_training_losses = []
+    train_losses = []
+    test_losses = []
+
     # Training loop
     for epoch in range(args.start_epoch, args.epochs):
         model.train()
@@ -190,6 +234,8 @@ def train(args):
             if is_avg_epoch:
                 local_model.load_state_dict(model.state_dict())
 
+            test_local_total_loss = 0
+            total_samples = 0
             for inputs, targets in train_loaders_splitted[i]:
                 inputs, targets = inputs.to(device), targets.to(device)
                 local_optimizer.zero_grad()
@@ -197,8 +243,10 @@ def train(args):
                 loss = criterion(outputs, targets)
                 loss.backward()
                 local_optimizer.step()
+                test_local_total_loss += loss.item() * inputs.size(0)  # Multiply by batch size
+                total_samples += inputs.size(0)
 
-            local_losses.append(loss.item())
+            local_losses.append(test_local_total_loss / total_samples)
 
         epochs_done_until_avg += 1
         is_avg_epoch = False
@@ -222,14 +270,23 @@ def train(args):
             torch.save(model.state_dict(), args.best_model)
             print(f"Best model saved with loss = {best_loss}")
 
-        print(f"Epoch {epoch+1}: Loss = {loss.item()}")
+        print(f"Epoch {epoch+1}: Loss = {epoch_loss}")
 
         # Evaluate on test set periodically
         if (epoch + 1) % args.eval_interval == 0:
             test_acc = evaluate(model, test_loader, device)
             train_acc = evaluate(model, train_loader, device)
             print(f"Epoch {epoch+1} - Test Accuracy: {test_acc:.2f}% - Train Accuracy: {train_acc:.2f}%")
+            epochs.append(epoch+1)
+            trainAccuracies.append(train_acc)
+            testAccuracies.append(test_acc)
+            epoch_training_losses.append(epoch_loss)
+            train_losses.append(epoch_loss) #TODO: verify if this this works. Before it was just loss.item(). But avg may be more stable
+            test_losses.append(compute_test_loss(model, test_loader, criterion, device))
 
+
+    plotEpochs(epochs, trainAccuracies, testAccuracies, 'Train accuracy', 'Test accuracy', 'accuracy_fig.png')
+    plotEpochs(epochs, train_losses, test_losses, 'Train losses', 'Test losses', 'losses_fig.png')
     print("Training completed. Best model loaded.")
     return model, train_loader, test_loader, device
 
@@ -269,10 +326,12 @@ def main():
 
     if args.epochs % args.J != 0:
         raise ValueError("Number of epochs must be a multiple of J")
+    if args.eval_interval % args.J != 0:
+        raise ValueError("Eval interval must be a multiple of J")
 
     model, train_loader, test_loader, device = train(args)
-    evaluate(model, train_loader, device)
-    evaluate(model, test_loader, device)
+    plt.show()
+
 
 # if __name__ == '__main__':
 #     main()
