@@ -113,13 +113,13 @@ def load_data(batch_size, hardTransform):
 
     return train_dataset, test_dataset, train_loader, test_loader
 
-def create_optimizer(opt_name, model, lr, weight_decay=0.0001):
+def create_optimizer(opt_name, model, lr, weight_decay=0.0001, momentum=0.9):
     if opt_name.lower() == 'sgd':
-        return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+        return optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
     elif opt_name.lower() == 'adam':
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt_name.lower() == 'lars':
-        return optim2.LARS(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9, eps=1e-8, trust_coefficient=0.001)
+        return optim2.LARS(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, eps=1e-8, trust_coefficient=0.001)
     elif opt_name.lower() == 'lamb':
         return optim2.LAMB(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-6)
     else:
@@ -241,7 +241,7 @@ def train(args):
         local_losses = []
 
         for i, local_model in enumerate(local_models):
-            local_optimizer = create_optimizer(args.optimizer, local_model, lr)
+            local_optimizer = create_optimizer(args.optimizer, local_model, lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
             if is_avg_epoch:
                 local_model.load_state_dict(model.state_dict())
@@ -299,6 +299,7 @@ def train(args):
             with open('accuraciesAndLosses.csv', mode='a', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow([epoch+1, train_acc, test_acc, epoch_train_loss, test_loss])  # Write headers
+                torch.save(model.state_dict(), args.last_model) #save model only with the csv
 
 
 
@@ -313,6 +314,7 @@ def main():
     parser.add_argument('--J', type=int, default=1, help='Interval for weight averaging')
     parser.add_argument('--epochs', type=int, default=150, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for training')
+    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for training')
     parser.add_argument('--lr-max', type=float, default=0.01, help='Learning rate max of cosine annealing')
     parser.add_argument('--lr-min', type=float, default=0.001, help='Learning rate min of cosine annealing')
     parser.add_argument('--weight-decay', type=float, default=0.0001, help='Weight decay')
