@@ -12,58 +12,11 @@ from torch.utils.data import random_split
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
-import torch_optimizer as optim2
+import torch_optimizer as optim_torch
 import math
+from torch.cuda.amp import autocast, GradScaler
 
 
-#for now I comment, but we are not allowed to use this architecture!
-# class LeNet5V2(nn.Module):
-#     def __init__(self, args, num_classes=100):
-#         super(LeNet5V2, self).__init__()
-#         self.conv1 = nn.Conv2d(3, 64, kernel_size=5, stride=1, padding=2)
-#         self.bn1 = nn.BatchNorm2d(64)
-#         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-#         self.conv2 = nn.Conv2d(64, 64, kernel_size=5, stride=1, padding=2)  # Added padding
-#         self.bn2 = nn.BatchNorm2d(64)
-#         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-#         # Adjusted size calculation based on padding
-#         self.fc1 = nn.Linear(64 * 8 * 8, 384)  # Updated size
-#         self.bn3 = nn.BatchNorm1d(384)
-#         self.dropout1 = nn.Dropout(args.dropout1)
-
-#         self.fc2 = nn.Linear(384, 192)
-#         self.bn4 = nn.BatchNorm1d(192)
-#         self.dropout2 = nn.Dropout(args.dropout2)
-
-#         self.fc3 = nn.Linear(192, num_classes)
-
-#         # Proper initialization
-#         if args.init_weights:
-#             self._initialize_weights()
-
-#     def forward(self, x):
-#         x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-#         x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-#         x = x.view(-1, 64 * 8 * 8)  # Updated size
-#         x = self.dropout1(F.relu(self.bn3(self.fc1(x))))
-#         x = self.dropout2(F.relu(self.bn4(self.fc2(x))))
-#         x = self.fc3(x)
-#         return x
-
-#     def _initialize_weights(self):
-#         for m in self.modules():
-#             if isinstance(m, nn.Conv2d):
-#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-#                 if m.bias is not None:
-#                     nn.init.constant_(m.bias, 0)
-#             elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
-#                 nn.init.constant_(m.weight, 1)
-#                 nn.init.constant_(m.bias, 0)
-#             elif isinstance(m, nn.Linear):
-#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-#                 nn.init.constant_(m.bias, 0)
 
 
 class LeNet5(nn.Module):
@@ -73,21 +26,22 @@ class LeNet5(nn.Module):
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=5, stride=1)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Adjusting fc1 input size to match the output of conv/pool layers
         self.fc1 = nn.Linear(64 * 6 * 6, 384)
         self.fc2 = nn.Linear(384, 192)
         self.fc3 = nn.Linear(192, num_classes)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool2(x)
-        x = x.view(-1, 64 * 6 * 6)
+        x = F.relu(self.conv1(x))  # Output: (batch_size, 64, 32, 32)
+        x = self.pool1(x)          # Output: (batch_size, 64, 16, 16)
+        x = F.relu(self.conv2(x))  # Output: (batch_size, 64, 12, 12)
+        x = self.pool2(x)          # Output: (batch_size, 64, 6, 6)
+        x = x.view(x.size(0), -1)  # Flatten to (batch_size, 64 * 6 * 6)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
-
 
 
 def load_data(batch_size, hardTransform):
@@ -95,14 +49,13 @@ def load_data(batch_size, hardTransform):
         transform = Compose([
             RandomCrop(32, padding=4),
             RandomHorizontalFlip(),
-            RandomRotation(10),
             ToTensor(),
-            Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            Normalize((0.5071, 0.4867, 0.4408), (0.2673, 0.2564, 0.2762))
         ])
     else:
         transform = Compose([
             ToTensor(),
-            Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            Normalize((0.5071, 0.4867, 0.4408), (0.2673, 0.2564, 0.2762))
         ])
 
     train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
@@ -119,9 +72,9 @@ def create_optimizer(opt_name, model, lr, weight_decay=0.0001, momentum=0.9):
     elif opt_name.lower() == 'adam':
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt_name.lower() == 'lars':
-        return optim2.LARS(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, eps=1e-8, trust_coefficient=0.001)
+        return optim_torch.LARS(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, eps=1e-8, trust_coefficient=0.001)
     elif opt_name.lower() == 'lamb':
-        return optim2.LAMB(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-6)
+        return optim_torch.LAMB(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-6)
     else:
         raise ValueError(f"Optimizer {opt_name} not supported")
 
@@ -171,17 +124,6 @@ def compute_test_loss(model, test_loader, criterion, device):
     return average_loss
 
 
-#TODO next
-# def computeLoss(train_loaders_splitted, device, local_optimizer, local_model, criterion):
-#     for inputs, targets in train_loaders_splitted[i]:
-#         inputs, targets = inputs.to(device), targets.to(device)
-#         local_optimizer.zero_grad()
-#         outputs = local_model(inputs)
-#         loss = criterion(outputs, targets)
-#         loss.backward()
-#         local_optimizer.step()
-
-
 
 def train(args):
     # Setup device and distributed training
@@ -193,32 +135,16 @@ def train(args):
     # Initialize model
     if args.model_version == 1:
         model = LeNet5()
-    else:
-        model = LeNet5V2(args)
     if args.starting_model:
         model.load_state_dict(torch.load(args.starting_model))
     model.to(device)
 
-    # Setup distributed model
-    if dist.is_initialized():
-        model = DDP(model)
-
-    # Split dataset for LocalSGD
-    total_size = len(train_dataset)
-    split_size = total_size // args.K
-    split_sizes = [split_size] * (args.K-1) + [total_size - (args.K-1) * split_size]
-    train_subsets = random_split(train_dataset, split_sizes)
-    train_loaders_splitted = [torch.utils.data.DataLoader(subset, batch_size=args.batch_size, shuffle=True)
-                             for subset in train_subsets]
 
     # Setup training
     criterion = nn.CrossEntropyLoss()
     local_models = [model.to(device) for _ in range(args.K)]
-    best_loss = float('inf')
-    epochs_done_until_avg = 0
-    is_avg_epoch = False
 
-    print(f"Training with {args.K} splits and averaging every {args.J} epochs")
+    print(f"Training with {args.K} splits and averaging every {args.J} epochs, woth {args.warmup} warmup epochs")
 
     epochs = []
     trainAccuracies = []
@@ -232,56 +158,51 @@ def train(args):
             writer.writerow(['epoch', 'train-accuracy', 'test-accuracy', 'train_loss', 'test-loss'])  # Write headers
 
 
+    tot_epochs = args.warmup + args.epochs
     # Training loop
-    for epoch in range(args.start_epoch, args.epochs):
+    #for each epoch
+    for epoch in range(args.start_epoch, tot_epochs):
         #change lr by applying cosine annealing:
         lr = args.lr_min + 0.5 * (args.lr_max - args.lr_min) * (1 + math.cos(math.pi * epoch / args.epochs))
 
-        model.train()
+        model.train() #activate model for training
         local_losses = []
+        iterator = iter(train_loader)
+        remaining_iterations = len(train_loader)
+        steps_before_avg = min(args.J, remaining_iterations/args.K) #just in case we are in the last step and we to not have enough batches, we apply less steps
+        while remaining_iterations>=args.K: #I discard the last few iterations that does not have enough local models
+            for i, local_model in enumerate(local_models): #for each local model
+                if remaining_iterations<0:
+                    break
+                test_local_total_loss, total_samples = 0.0, 0
+                if args.K>1 or epoch==1: #load global model
+                    local_model.load_state_dict(model.state_dict())
+                local_model.train()
+                local_optimizer = create_optimizer(args.optimizer, local_model, lr, momentum=args.momentum, weight_decay=args.weight_decay)
+                for nTime in range(steps_before_avg): #for J times
+                    inputs, targets = next(iterator) #get a piece of the dataset.
+                    remaining_iterations -=1 #1 less iteration after getting piece of the dataset
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    local_optimizer.zero_grad()
+                    outputs = local_model(inputs)
+                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    local_optimizer.step() 
+                    test_local_total_loss += loss.item() * inputs.size(0)  # Multiply by batch size
+                    total_samples += inputs.size(0)
+                    if remaining_iterations<0:
+                        break
 
-        for i, local_model in enumerate(local_models):
-            local_optimizer = create_optimizer(args.optimizer, local_model, lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-            if is_avg_epoch:
-                local_model.load_state_dict(model.state_dict())
-
-            test_local_total_loss = 0
-            total_samples = 0
-            for inputs, targets in train_loaders_splitted[i]:
-                inputs, targets = inputs.to(device), targets.to(device)
-                local_optimizer.zero_grad()
-                outputs = local_model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                local_optimizer.step()
-                test_local_total_loss += loss.item() * inputs.size(0)  # Multiply by batch size
-                total_samples += inputs.size(0)
-
-            local_losses.append(test_local_total_loss / total_samples)
-
-        epochs_done_until_avg += 1
-        is_avg_epoch = False
-
-        # Model averaging
-        if epochs_done_until_avg == args.J:
-            global_dict = model.state_dict()
-            for key in global_dict:
-                global_dict[key] = torch.mean(torch.stack([local_models[i].state_dict()[key].float()
-                                                         for i in range(args.K)]), dim=0)
-            if args.J > 1:
-                print(f"Model updated at epoch {epoch + 1}")
-            model.load_state_dict(global_dict)
-            epochs_done_until_avg = 0
-            is_avg_epoch = True
-            torch.save(model.state_dict(), args.last_model)
+                local_losses.append(test_local_total_loss / total_samples) #append avg local losses
+            if args.K>1:                
+                global_dict = model.state_dict() #After all local_models have been trained, avg
+                for key in global_dict:
+                    global_dict[key] = torch.mean(torch.stack([local_models[i].state_dict()[key].float()
+                                                            for i in range(args.K)]), dim=0)
+                model.load_state_dict(global_dict)
 
         epoch_train_loss = np.mean(local_losses)
-        if best_loss > epoch_train_loss:
-            best_loss = epoch_train_loss
-            torch.save(model.state_dict(), args.best_model)
-            print(f"Best model saved with loss = {best_loss}")
-
         print(f"Epoch {epoch+1}: Training Loss = {epoch_train_loss}")
 
         # Evaluate on test set periodically
@@ -292,16 +213,14 @@ def train(args):
             trainAccuracies.append(train_acc)
             testAccuracies.append(test_acc)
             epoch_training_losses.append(epoch_train_loss)
-            train_losses.append(epoch_train_loss) #TODO: verify if this this works. Before it was just loss.item(). But avg may be more stable
+            train_losses.append(epoch_train_loss)
             test_loss = compute_test_loss(model, test_loader, criterion, device)
             test_losses.append(test_loss)
             print(f"Epoch {epoch+1} - Test Accuracy: {test_acc:.2f}% - Train Accuracy: {train_acc:.2f}% - Test Loss: {test_loss} - Current LR: {lr}")
             with open('accuraciesAndLosses.csv', mode='a', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow([epoch+1, train_acc, test_acc, epoch_train_loss, test_loss])  # Write headers
-                torch.save(model.state_dict(), args.last_model) #save model only with the csv
-
-
+                torch.save(model.state_dict(), args.last_model) #save model with the csv
 
     plotEpochs(epochs, trainAccuracies, testAccuracies, 'Train accuracy', 'Test accuracy', 'accuracy_fig.png')
     plotEpochs(epochs, train_losses, test_losses, 'Train losses', 'Test losses', 'losses_fig.png')
@@ -335,6 +254,11 @@ def main():
                        help='Say if we want to add harder transformations or not')
     parser.add_argument('--model-version', type=int, default=1,
                        help='Say what version of the model we want to use (1 or 2)')
+    parser.add_argument('--warmup', type=int, default=0,
+                       help='If 0, no warmup is applied')
+    parser.add_argument('--slowMMO-value', type=float, default=0.0,
+                       help='Used to apply slowMMO. If 0, it applies simple FedAVG to average the weights')
+
     #must be removed: model 2 is not authorized!
     # parser.add_argument('--dropout1', type=float, default=0,
     #                    help='Says the first dropout. If 0 it is not applied. 0.5 is a default.')
