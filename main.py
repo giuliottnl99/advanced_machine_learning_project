@@ -50,23 +50,29 @@ def load_data(batch_size, hardTransform):
             RandomCrop(32, padding=4),
             RandomHorizontalFlip(),
             ToTensor(),
-            Normalize((0.5071, 0.4867, 0.4408), (0.2673, 0.2564, 0.2762))
+            Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2673, 0.2564, 0.2762))
         ])
     else:
         transform = Compose([
             ToTensor(),
-            Normalize((0.5071, 0.4867, 0.4408), (0.2673, 0.2564, 0.2762))
+            Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2673, 0.2564, 0.2762))
         ])
 
-    train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
+    full_train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
+    val_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
+
+    train_size = int(0.9 * len(full_train_dataset))  # 90% for training
+    test_size = len(full_train_dataset) - train_size  # Remaining 10% for validation
+    train_dataset, test_dataset = random_split(full_train_dataset, [train_size, test_size])
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    return train_dataset, test_dataset, train_loader, test_loader
+    return train_dataset, test_dataset, test_dataset, train_loader, test_loader, val_loader
 
 def create_optimizer(opt_name, model, lr, weight_decay=0.0001, momentum=0.9):
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     if opt_name.lower() == 'sgd':
         return optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
     elif opt_name.lower() == 'adam':
@@ -104,13 +110,13 @@ def plotEpochs(epochs, data_arr_1, data_arr_2, label1, label2, figName):
     plt.legend()
     plt.savefig(figName)
 
-def compute_test_loss(model, test_loader, criterion, device):
+def compute_loss(model, loader, criterion, device):
     model.eval()  # Set model to evaluation mode
     test_loss = 0.0
     total_samples = 0
 
     with torch.no_grad():  # Disable gradient computation
-        for inputs, targets in test_loader:
+        for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)  # Move data to the device
 
             # Forward pass
@@ -130,7 +136,7 @@ def train(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Load data
-    train_dataset, test_dataset, train_loader, test_loader = load_data(args.batch_size, args.transform)
+    train_dataset, test_dataset, val_dataset, train_loader, test_loader, val_loader = load_data(args.batch_size, args.transform)
 
     # Initialize model
     if args.model_version == 1:
@@ -141,35 +147,39 @@ def train(args):
 
 
     # Setup training
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1) #correct to change?
     local_models = [model.to(device) for _ in range(args.K)]
 
-    print(f"Training with {args.K} splits and averaging every {args.J} epochs, woth {args.warmup} warmup epochs")
+    print(f"Training with {args.K} splits and averaging every {args.J} epochs, {args.warmup} warmup epochs")
 
     epochs = []
     trainAccuracies = []
-    testAccuracies = []
+    valAccuracies = []
     epoch_training_losses = []
     train_losses = []
-    test_losses = []
+    val_losses = []
     if args.start_epoch==0: #create the file if we are starting a new model
         with open('accuraciesAndLosses.csv', mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['epoch', 'train-accuracy', 'test-accuracy', 'train_loss', 'test-loss'])  # Write headers
+            writer.writerow(['epoch', 'train-accuracy', 'val-accuracy', 'train_loss', 'val-loss'])  # Write headers
 
 
     tot_epochs = args.warmup + args.epochs
     # Training loop
     #for each epoch
+    start_factor = args.lr_max / (float(args.batch_size)/64.0) #es: lr_max=0.2 and batch_size=64 => start_factor=0.1
     for epoch in range(args.start_epoch, tot_epochs):
         #change lr by applying cosine annealing:
-        lr = args.lr_min + 0.5 * (args.lr_max - args.lr_min) * (1 + math.cos(math.pi * epoch / args.epochs))
-
+        lr = args.lr_min + 0.5 * (args.lr_max - args.lr_min) * (1 + math.cos(math.pi * epoch / (args.epochs-args.warmup)))
+        #if we are in warmup
+        if epoch<args.warmup:
+            lr = args.max_lr * (start_factor + (1 - start_factor) * (epoch / args.warmup))
         model.train() #activate model for training
         local_losses = []
         iterator = iter(train_loader)
         remaining_iterations = len(train_loader)
         steps_before_avg = min(args.J, remaining_iterations/args.K) #just in case we are in the last step and we to not have enough batches, we apply less steps
+        scaler = GradScaler()
         while remaining_iterations>=args.K: #I discard the last few iterations that does not have enough local models
             for i, local_model in enumerate(local_models): #for each local model
                 if remaining_iterations<0:
@@ -186,8 +196,12 @@ def train(args):
                     local_optimizer.zero_grad()
                     outputs = local_model(inputs)
                     loss = criterion(outputs, targets)
-                    loss.backward()
-                    local_optimizer.step() 
+                    # loss.backward()
+                    # local_optimizer.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(local_optimizer)
+                    scaler.update()
+ 
                     test_local_total_loss += loss.item() * inputs.size(0)  # Multiply by batch size
                     total_samples += inputs.size(0)
                     if remaining_iterations<0:
@@ -198,7 +212,7 @@ def train(args):
             if args.K>1:                
                 global_dict = model.state_dict() #After all local_models have been trained, avg
                 for key in global_dict:
-                    global_dict[key] = torch.mean(torch.stack([local_models[i].state_dict()[key].float()
+                    global_dict[key] = global_dict[key] * args.slowMMO + (1-args.slowMMO) * torch.mean(torch.stack([local_models[i].state_dict()[key].float()
                                                             for i in range(args.K)]), dim=0)
                 model.load_state_dict(global_dict)
 
@@ -207,25 +221,28 @@ def train(args):
 
         # Evaluate on test set periodically
         if (epoch + 1) % args.eval_interval == 0:
-            test_acc = evaluate(model, test_loader, device)
+            val_acc = evaluate(model, val_loader, device)
             train_acc = evaluate(model, train_loader, device)
             epochs.append(epoch+1)
             trainAccuracies.append(train_acc)
-            testAccuracies.append(test_acc)
+            valAccuracies.append(val_acc)
             epoch_training_losses.append(epoch_train_loss)
             train_losses.append(epoch_train_loss)
-            test_loss = compute_test_loss(model, test_loader, criterion, device)
-            test_losses.append(test_loss)
-            print(f"Epoch {epoch+1} - Test Accuracy: {test_acc:.2f}% - Train Accuracy: {train_acc:.2f}% - Test Loss: {test_loss} - Current LR: {lr}")
+            val_loss = compute_loss(model, val_loader, criterion, device)
+            val_losses.append(val_loss)
+            print(f"Epoch {epoch+1} - Validation Accuracy: {val_acc:.2f}% - Train Accuracy: {train_acc:.2f}% - Validation Loss: {val_loss} - Current LR: {lr}")
             with open('accuraciesAndLosses.csv', mode='a', newline='') as file:
                 writer = csv.writer(file)
-                writer.writerow([epoch+1, train_acc, test_acc, epoch_train_loss, test_loss])  # Write headers
+                writer.writerow([epoch+1, train_acc, val_acc, epoch_train_loss, val_loss])  # Write headers
                 torch.save(model.state_dict(), args.last_model) #save model with the csv
 
-    plotEpochs(epochs, trainAccuracies, testAccuracies, 'Train accuracy', 'Test accuracy', 'accuracy_fig.png')
-    plotEpochs(epochs, train_losses, test_losses, 'Train losses', 'Test losses', 'losses_fig.png')
-    print("Training completed. Best model loaded.")
-    return model, train_loader, test_loader, device
+    plotEpochs(epochs, trainAccuracies, valAccuracies, 'Train accuracy', 'Val accuracy', 'accuracy_fig.png')
+    plotEpochs(epochs, train_losses, val_losses, 'Train losses', 'Val losses', 'losses_fig.png')
+    test_acc = evaluate(model, test_loader, device)
+    test_loss = compute_loss(model, test_loader, criterion, device)
+
+    print(f"Training completed - Test Accuracy: {test_acc:.2f}% - Test Loss: {test_loss:.2f}")
+    return model, train_loader, val_loader, device
 
 def main():
     parser = argparse.ArgumentParser(description='Distributed Learning with LocalSGD')
@@ -256,7 +273,7 @@ def main():
                        help='Say what version of the model we want to use (1 or 2)')
     parser.add_argument('--warmup', type=int, default=0,
                        help='If 0, no warmup is applied')
-    parser.add_argument('--slowMMO-value', type=float, default=0.0,
+    parser.add_argument('--slowMMO', type=float, default=0.0,
                        help='Used to apply slowMMO. If 0, it applies simple FedAVG to average the weights')
 
     #must be removed: model 2 is not authorized!
