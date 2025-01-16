@@ -63,13 +63,14 @@ def load_data(batch_size, hardTransform):
 
     train_size = int(0.9 * len(full_train_dataset))  # 90% for training
     test_size = len(full_train_dataset) - train_size  # Remaining 10% for validation
+    torch.manual_seed(42)
     train_dataset, test_dataset = random_split(full_train_dataset, [train_size, test_size])
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    return train_dataset, test_dataset, test_dataset, train_loader, test_loader, val_loader
+    return train_dataset, test_dataset, val_dataset, train_loader, test_loader, val_loader
 
 def create_optimizer(opt_name, model, lr, weight_decay=0.0001, momentum=0.9):
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -167,19 +168,32 @@ def train(args):
     tot_epochs = args.warmup + args.epochs
     # Training loop
     #for each epoch
-    start_factor = args.lr_max / (float(args.batch_size)/64.0) #es: lr_max=0.2 and batch_size=64 => start_factor=0.1
+    lr_max_after_warmup = args.lr_max * ((float(args.batch_size)/64.0)**0.5) #Used for large batches. es: lr_max=0.1 and batch_size=128 => lr_max_after_warmup=1.412
+
+    lr_max_before_warmup = args.lr_max
+    if args.from_zero_warmup:
+        lr_max_before_warmup = 0.0
+    lr = lr_max_after_warmup
+
     for epoch in range(args.start_epoch, tot_epochs):
-        #change lr by applying cosine annealing:
-        lr = args.lr_min + 0.5 * (args.lr_max - args.lr_min) * (1 + math.cos(math.pi * epoch / (args.epochs-args.warmup)))
-        #if we are in warmup
-        if epoch<args.warmup:
-            lr = args.max_lr * (start_factor + (1 - start_factor) * (epoch / args.warmup))
+        warmed_up_epoch = epoch - args.warmup #this is the epoch when the effective training starts
+        if (args.optimizer=='sgd' or args.optimizer=='adam') and epoch>=args.warmup:
+            lr = args.lr_min + 0.5 * (lr_max_after_warmup - args.lr_min) * (1 + math.cos(math.pi * warmed_up_epoch / (args.epochs))) #change lr by applying cosine annealing:
+        elif (args.optimizer=='lars' or args.optimizer=='lamb') and epoch>=args.warmup:
+            decay_factor = (1 - (warmed_up_epoch / args.epochs))
+            lr = lr_max_after_warmup * decay_factor #change lr by applying polynomial decay:
+        elif epoch<args.warmup:         #if we are in warmup
+            lr = lr_max_before_warmup + (lr_max_after_warmup - lr_max_before_warmup)*(float(epoch)/float(args.warmup))
+        if epoch==args.warmup and args.warmup != 0:
+            print("warmup terminated")
         model.train() #activate model for training
         local_losses = []
         iterator = iter(train_loader)
         remaining_iterations = len(train_loader)
         steps_before_avg = min(args.J, remaining_iterations/args.K) #just in case we are in the last step and we to not have enough batches, we apply less steps
         scaler = GradScaler()
+        local_optimizer = create_optimizer(args.optimizer, model, lr, momentum=args.momentum, weight_decay=args.weight_decay) #initialize in case there is only one. This saves computational power. 
+
         while remaining_iterations>=args.K: #I discard the last few iterations that does not have enough local models
             for i, local_model in enumerate(local_models): #for each local model
                 if remaining_iterations<0:
@@ -187,8 +201,11 @@ def train(args):
                 test_local_total_loss, total_samples = 0.0, 0
                 if args.K>1 or epoch==1: #load global model
                     local_model.load_state_dict(model.state_dict())
-                local_model.train()
-                local_optimizer = create_optimizer(args.optimizer, local_model, lr, momentum=args.momentum, weight_decay=args.weight_decay)
+                    local_model.train()
+                    local_optimizer = create_optimizer(args.optimizer, local_model, lr, momentum=args.momentum, weight_decay=args.weight_decay)
+                else:
+                    local_model.train()
+
                 for nTime in range(steps_before_avg): #for J times
                     inputs, targets = next(iterator) #get a piece of the dataset.
                     remaining_iterations -=1 #1 less iteration after getting piece of the dataset
@@ -196,8 +213,6 @@ def train(args):
                     local_optimizer.zero_grad()
                     outputs = local_model(inputs)
                     loss = criterion(outputs, targets)
-                    # loss.backward()
-                    # local_optimizer.step()
                     scaler.scale(loss).backward()
                     scaler.step(local_optimizer)
                     scaler.update()
@@ -217,7 +232,7 @@ def train(args):
                 model.load_state_dict(global_dict)
 
         epoch_train_loss = np.mean(local_losses)
-        print(f"Epoch {epoch+1}: Training Loss = {epoch_train_loss}")
+        print(f"Epoch {epoch+1}: Training Loss = {epoch_train_loss} lr={lr}")
 
         # Evaluate on test set periodically
         if (epoch + 1) % args.eval_interval == 0:
@@ -256,8 +271,6 @@ def main():
     parser.add_argument('--weight-decay', type=float, default=0.0001, help='Weight decay')
     parser.add_argument('--optimizer', type=str, default='sgd',
                        choices=['sgd', 'adam', 'lars', 'lamb'], help='Optimizer to use')
-    parser.add_argument('--best-model', type=str, default='best_model.pth',
-                       help='Path to save best model')
     parser.add_argument('--last-model', type=str, default='last_model.pth',
                        help='Path to save last model')
     parser.add_argument('--starting-model', type=str, default=None,
@@ -275,21 +288,16 @@ def main():
                        help='If 0, no warmup is applied')
     parser.add_argument('--slowMMO', type=float, default=0.0,
                        help='Used to apply slowMMO. If 0, it applies simple FedAVG to average the weights')
+    parser.add_argument('--from-zero-warmup', type=bool, default=False,
+                       help='In case you want a special warmup, set to 0')
 
-    #must be removed: model 2 is not authorized!
-    # parser.add_argument('--dropout1', type=float, default=0,
-    #                    help='Says the first dropout. If 0 it is not applied. 0.5 is a default.')
-    # parser.add_argument('--dropout2', type=float, default=0,
-    #                    help='Says the second dropout. If 0 it is not applied. 0.5 is a default.')
-    # parser.add_argument('--init-weights', type=bool, default=False,
-    #                    help='Says if weights must be initialized or not.')
+    valid_args = {action.option_strings[0] for action in parser._actions if action.option_strings}
+    unrecognized_args = {arg for arg in sys.argv[1:] if arg.startswith("--") and arg not in valid_args}
+    if unrecognized_args:
+        raise ValueError(f"Unrecognized arguments found: {unrecognized_args}")
+
 
     args, uknown = parser.parse_known_args()
-
-    if args.epochs % args.J != 0:
-        raise ValueError("Number of epochs must be a multiple of J")
-    if args.eval_interval % args.J != 0:
-        raise ValueError("Eval interval must be a multiple of J")
 
     model, train_loader, test_loader, device = train(args)
     plt.show()
