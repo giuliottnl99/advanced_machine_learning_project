@@ -14,7 +14,7 @@ def plotFromCSV(csv_file):
     # Plotting Accuracy
     plt.figure()
     plt.plot(epochs, data['train-accuracy'], label='Train Accuracy')
-    plt.plot(epochs, data['test-accuracy'], label='Test Accuracy')
+    plt.plot(epochs, data['val-accuracy'], label='Test Accuracy')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.title('Accuracy Over Epochs')
@@ -24,7 +24,7 @@ def plotFromCSV(csv_file):
     # Plotting Loss
     plt.figure()
     plt.plot(epochs, data['train_loss'], label='Train Loss')
-    plt.plot(epochs, data['test-loss'], label='Test Loss')
+    plt.plot(epochs, data['val-loss'], label='Test Loss')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.title('Loss Over Epochs')
