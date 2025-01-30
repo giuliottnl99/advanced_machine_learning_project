@@ -328,7 +328,7 @@ def main():
     parser.add_argument('--slowMMO', type=float, default=0.0,
                        help='Used to apply slowMMO. If 0, it applies simple FedAVG to average the weights')
     parser.add_argument('--from-zero-warmup', type=bool, default=False,
-                       help='In case you want a special warmup, set to 0')
+                       help='In case you want a special warmup, set to True')
     parser.add_argument('--trust-coefficient', type=float, default=0.001,
                        help='Trust coefficient in LARS')
     parser.add_argument('--beta-2', type=float, default=0.999,
@@ -346,7 +346,7 @@ def main():
         raise ValueError(f"Unrecognized arguments found: {unrecognized_args}")
 
     args, uknown = parser.parse_known_args()
-    if (args.J*4)%8!=0:
+    if (args.J*4)%8!=0 and args.computational_power_unequal:
         raise ValueError(f"J*4 must be divisible by 8. J={args.J}")
 
     model, train_loader, test_loader, device = train(args)
