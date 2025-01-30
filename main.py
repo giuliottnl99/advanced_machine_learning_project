@@ -86,7 +86,6 @@ def create_optimizer(args, model, lr):
         from tensorflow.keras import mixed_precision
         policy = mixed_precision.Policy('mixed_float16')
         mixed_precision.set_global_policy(policy)
-        # return LAMB(learning_rate=lr, beta_1=args.momentum, beta_2=args.beta_2, weight_decay=args.weight_decay, epsilon=1e-6, exclude_from_weight_decay=["bias", "LayerNorm"])
         return LAMB(learning_rate=lr, beta_1=args.momentum, beta_2=args.beta_2, weight_decay=args.weight_decay, epsilon=1e-6)
     else:
         raise ValueError(f"Optimizer {opt_name} not supported")
@@ -104,18 +103,6 @@ def evaluate(model, data_loader, device):
             correct += predicted.eq(targets).sum().item()
     return 100 * correct / total
 
-#TODO: manage the plot!
-def plotEpochs(epochs, data_arr_1, data_arr_2, label1, label2, figName): 
-    #inputArray format: {epoch: 'number', var1: 'trainAcc', var2: 'testAcc'}
-    #labelsFormat: {lab1: 'label', lab2: 'label'}
-    plt.figure()
-    plt.plot(epochs, data_arr_1, label=label1)
-    plt.plot(epochs, data_arr_2, label=label2)
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Loss Over Epochs')
-    plt.legend()
-    plt.savefig(figName)
 
 def compute_loss(model, loader, criterion, device):
     model.eval()  # Set model to evaluation mode
@@ -147,7 +134,7 @@ def initializeLrs(args):
     return lr_max_after_warmup, lr_max_before_warmup, lr
 
 def computeCurrentLr(args, epoch, lr_max_after_warmup, lr_max_before_warmup):
-    warmed_up_epoch = epoch - args.warmup #this is the epoch when the effective training starts
+    warmed_up_epoch = epoch - args.warmup #this is the epoch when the effective training (afetr warmup) starts
     if (args.optimizer=='sgd' or args.optimizer=='adam') and epoch>=args.warmup:
         lr = args.lr_min + 0.5 * (lr_max_after_warmup - args.lr_min) * (1 + math.cos(math.pi * warmed_up_epoch / (args.epochs))) #change lr by applying cosine annealing:
     elif (args.optimizer=='lars' or args.optimizer=='lamb') and epoch>=args.warmup:
@@ -166,8 +153,8 @@ def runBatchTrain(args, iterator, device, local_optimizer, local_model, criterio
         local_optimizer.zero_grad()
     outputs = local_model(inputs)
     loss = criterion(outputs, targets)
-    scaler.scale(loss).backward()
     if args.optimizer != 'lamb':
+        scaler.scale(loss).backward()
         scaler.step(local_optimizer)
         scaler.update()
 
@@ -188,7 +175,7 @@ def updateLocalModel(args, model, epoch, local_model, local_optimizer, lr):
 def trainLocalModelForJSteps(args, remaining_iterations, local_losses, local_model, local_optimizer, criterion, iterator, device, scaler, steps_before_avg, local_model_num):
     test_local_total_loss, total_samples = 0.0, 0
 
-    for nTime in range(steps_before_avg): #for J times
+    for nTime in range(int(steps_before_avg)): #for J times
         test_local_total_loss, total_samples = runBatchTrain(args, iterator, device, local_optimizer, local_model, criterion, scaler, test_local_total_loss, total_samples)
         remaining_iterations -= 1
         if remaining_iterations <=0:
@@ -205,9 +192,16 @@ def trainLocalModelForJSteps(args, remaining_iterations, local_losses, local_mod
 
 def updateGlobalModel(args, model, local_models):
     global_dict = model.state_dict() #After all local_models have been trained, avg
-    for key in global_dict:
-        global_dict[key] = global_dict[key] * args.slowMMO + (1-args.slowMMO) * torch.mean(torch.stack([local_models[i].state_dict()[key].float()
-                                                for i in range(args.K)]), dim=0)
+    if args.use_weighted_avg_for_J_unequal: #If I have to do the weighted average for J divisor:
+        Jdivisor, avgJDivisor = [1.0, 2.0, 4.0, 8.0], 3.75 
+        for key in global_dict:
+            global_dict[key] = global_dict[key] * args.slowMMO + (1-args.slowMMO) * torch.mean(torch.stack([local_models[i].state_dict()[key].float()*torch.tensor(Jdivisor[i] / avgJDivisor, dtype=torch.float32)
+                                                    for i in range(args.K)]), dim=0)
+    else:
+        for key in global_dict:
+            global_dict[key] = global_dict[key] * args.slowMMO + (1-args.slowMMO) * torch.mean(torch.stack([local_models[i].state_dict()[key].float()
+                                        for i in range(args.K)]), dim=0)
+            
     model.load_state_dict(global_dict)
 
 def updateCsvAndLastModel(model, device, csv_name, last_model_path, epoch, train_loader, val_loader, epoch_train_loss, criterion):
@@ -230,6 +224,7 @@ def initCsvFile(csv_name):
 def train(args):
     # Setup device and distributed training
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    first_run_on_local_model = True
 
     # Load data
     train_dataset, test_dataset, val_dataset, train_loader, test_loader, val_loader = load_data(args.batch_size, args.transform)
@@ -260,20 +255,36 @@ def train(args):
         model.train() #activate model for training
         local_losses, iterator, remaining_iterations, scaler, breakNext = [], iter(train_loader), len(train_loader), GradScaler(), False
         local_optimizer = create_optimizer(args, model, lr) #initialize in case there is only one. This saves computational power. 
+        total_cycles=0
         while remaining_iterations>=args.K and breakNext==False: #I discard the last few iterations that does not have enough local models
             if args.J>=float(remaining_iterations)/float(args.K): #
                 breakNext=True
             steps_before_avg = min(args.J, math.floor(float(remaining_iterations)/float(args.K))) #just in case we are in the last step and we to not have enough batches, we apply less steps
-            if first_epoch and steps_before_avg<args.J:
-                print(f"last batch of the epoch has {steps_before_avg} steps before avg.")
-
+            if args.computational_power_unequal and args.K==4: #If we are using parallelized batches, to a multiple of 15. If 0, break!
+                    steps_before_avg = math.floor((steps_before_avg*4.0)/15.0)*(15/4)
+                    if steps_before_avg==0: break
+            global first_epoch
+            if first_epoch and steps_before_avg<args.J and args.computational_power_unequal==False:
+                print(f"last batch of the epoch has {steps_before_avg} steps before avg. Complete cycles run for the epoch: {total_cycles}")
+            if args.dont_use_fragmented_batches and steps_before_avg<args.J: #If I don't want to use fragmented batches, I skip the last batch
+                first_epoch=False
+                break
             for i, local_model in enumerate(local_models): #for each local model
+                steps_before_avg_local = steps_before_avg #I make a copy to avoid aliasing problems
+                if args.computational_power_unequal and args.K==4: #Simulate a situation where each local worker performs a different number of steps:
+                    JMultiplier = [1.0/15.0, 2.0/15.0, 4.0/15.0, 8.0/15.0]
+                    steps_before_avg_local = math.floor(steps_before_avg*4*JMultiplier[i])
+                    if first_run_on_local_model:
+                        print(f"local model {i} has {steps_before_avg_local} steps before avg")
+
                 local_model, local_optimizer = updateLocalModel(args, model, epoch, local_model, local_optimizer, lr) #TODO: change this!
-                local_losses, remaining_iterations, breakNext = trainLocalModelForJSteps(args, remaining_iterations, local_losses, local_model, local_optimizer, criterion, iterator, device, scaler, steps_before_avg, i)
+                local_losses, remaining_iterations, breakNext = trainLocalModelForJSteps(args, remaining_iterations, local_losses, local_model, local_optimizer, criterion, iterator, device, scaler, steps_before_avg_local, i)
                 if breakNext:
                     break
+            first_run_on_local_model = False
             if args.K>1:                
                 updateGlobalModel(args, model, local_models)
+                total_cycles+=1
         epoch_train_loss = np.mean(local_losses)
         print(f"Epoch {epoch+1}: Training Loss = {epoch_train_loss} lr={lr}")
 
@@ -322,14 +333,21 @@ def main():
                        help='Trust coefficient in LARS')
     parser.add_argument('--beta-2', type=float, default=0.999,
                        help='Beta-2 in LAMB')
+    parser.add_argument('--dont-use-fragmented-batches', type=bool, default=False,
+            help='When set to true, the last batch with size<J will be skipped instead of used')
+    parser.add_argument('--computational-power-unequal', type=bool, default=False,
+            help='When set to true, the J is splitted into: 1/16, 3/16, 4/16, 8/16, only for K=4 ')
+    parser.add_argument('--use-weighted-avg-for-J-unequal', type=bool, default=False,
+            help='When also \'computational-power-unequal\' is True, the avg is weighted on the number of steps of each local worker')
 
     valid_args = {action.option_strings[0] for action in parser._actions if action.option_strings}
     unrecognized_args = {arg for arg in sys.argv[1:] if arg.startswith("--") and arg not in valid_args}
     if unrecognized_args:
         raise ValueError(f"Unrecognized arguments found: {unrecognized_args}")
 
-
     args, uknown = parser.parse_known_args()
+    if (args.J*4)%8!=0:
+        raise ValueError(f"J*4 must be divisible by 8. J={args.J}")
 
     model, train_loader, test_loader, device = train(args)
 
